@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Board Cutting Optimizer — Browser</title>
+<style>
+  :root{--ink:#111;--muted:#666;--bg:#fafafa;--panel:#fff;--ring:#ddd}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:14px 18px;border-bottom:1px solid var(--ring);background:var(--panel);position:sticky;top:0;z-index:5}
+  header h1{margin:0;font-size:18px}
+  main{max-width:1200px;margin:22px auto;padding:0 16px 40px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .card{background:var(--panel);border:1px solid var(--ring);border-radius:10px;padding:12px}
+  .card h2{margin:2px 0 8px;font-size:16px}
+  .card h3{margin:8px 0 6px;font-size:13px;color:var(--muted)}
+  textarea{width:100%;min-height:220px;resize:vertical;font:12px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .row label{font-size:12px;color:var(--muted)}
+  .row input{width:90px;padding:6px 8px;border:1px solid var(--ring);border-radius:8px}
+  button{padding:8px 12px;border:1px solid var(--ring);border-radius:8px;background:#fff;cursor:pointer}
+  button.primary{background:#111;color:#fff;border-color:#111}
+  .hint{color:var(--muted);font-size:12px}
+  .boards{display:grid;grid-template-columns:1fr;gap:16px;margin-top:12px}
+  .boardPage{background:var(--panel);border:1px solid var(--ring);border-radius:10px;padding:10px}
+  .tools{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 0}
+  svg{width:100%;height:auto;border:1px solid var(--ring);background:#fff}
+  @media (max-width:1000px){.grid{grid-template-columns:1fr}}
+  @media print{
+    header,.card.controls{display:none!important}
+    main{max-width:none;margin:0;padding:0}
+    .boardPage{page-break-after:always;border:none;border-radius:0;padding:0}
+    svg{border:none}
+    @page{size:letter portrait;margin:0.5in}
+  }
+</style>
+</head>
+<body>
+<header><h1>Board Cutting Optimizer — Browser (Guillotine • No Rotation • Kerf-Aware)</h1></header>
+<main>
+  <div class="grid">
+    <div class="card controls">
+      <h2>Input</h2>
+      <div class="row">
+        <label>Kerf (in)</label><input id="kerf" type="number" step="0.001" value="0.125">
+        <label>Gap Mult</label><input id="gapMult" type="number" step="0.1" value="1">
+        <label>Qty Mult</label><input id="qtyMult" type="number" step="1" value="1">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label>Trim L</label><input id="trimL" type="number" step="0.001" value="0">
+        <label>Trim R</label><input id="trimR" type="number" step="0.001" value="0">
+        <label>Trim B</label><input id="trimB" type="number" step="0.001" value="0">
+        <label>Trim T</label><input id="trimT" type="number" step="0.001" value="0">
+      </div>
+      <h3>Render Settings (for sizing/print)</h3>
+      <div class="row">
+        <label>Units / inch</label><input id="upi" type="number" step="1" value="40">
+        <label>Font px</label><input id="fontPx" type="number" step="1" value="11">
+        <label>Stroke px</label><input id="strokePx" type="number" step="0.2" value="0.9">
+        <span class="hint">Try 30–60 UPI; 40 works well on Letter.</span>
+      </div>
+
+      <h3>Pieces JSON</h3>
+      <textarea id="pieces"></textarea>
+      <h3>Stocks JSON</h3>
+      <textarea id="stocks"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" id="runBtn">Pack</button>
+        <button id="printBtn">Print</button>
+        <button id="exportBtn">Export JSON</button>
+        <span class="hint">All local — nothing uploaded.</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Result</h2>
+      <div id="summary" class="hint">Edit inputs and click <b>Pack</b>.</div>
+      <div id="pages" class="boards"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ---------- Helpers ----------*/
+const round3 = x => Math.round(x*1000)/1000;
+function areaStock(stocks){return stocks.reduce((s,b)=>s+b.width*b.length*b.qty,0)}
+function areaOneSet(pieces){return pieces.reduce((s,p)=>s+p.width*p.length*p.qty,0)}
+function buildInstances(N,pieces,qtyMult){const out=[];let id=0;for(const p of pieces){const t=p.qty*qtyMult*N;for(let i=0;i<t;i++)out.push({id:id++,name:p.name,w:p.width,h:p.length});}return out}
+function groupStocks(stocks){const m=new Map();for(const s of stocks){const k=`${s.length.toFixed(5)}|${s.width.toFixed(5)}`;if(!m.has(k))m.set(k,{len:s.length,w:s.width,qty:0});m.get(k).qty+=s.qty}const a=[...m.values()];a.sort((x,y)=>x.len===y.len?x.w-y.w:x.len-y.len);return a}
+function priorityKey(h,stockLen,eps=1e-6){const slack=stockLen-h;const exact=Math.abs(slack)<=eps;return [exact?0:1,slack>=0?slack:1e9,-h]}
+
+/* ---------- Kerf-aware guillotine packer (no rotation) ----------*/
+function packGroup(candidates, stockLen, stockW, qty, kerf, trims){
+  // Inflate bin by kerf (edge fits OK)
+  const binW=(stockW-trims.L-trims.R)+kerf;
+  const binH=(stockLen-trims.B-trims.T)+kerf;
+
+  function newBin(){return{W:binW,H:binH,free:[{x:0,y:0,w:binW,h:binH}],rects:[]}}
+  const bins=Array.from({length:qty},()=>newBin());
+  const placedIds=new Set();
+
+  function placeInBin(bin, r){
+    // Best-area-fit free rect
+    let bi=-1,bw=Infinity;
+    for(let i=0;i<bin.free.length;i++){
+      const fr=bin.free[i];
+      if(r.w<=fr.w+1e-9 && r.h<=fr.h+1e-9){
+        const waste=fr.w*fr.h-r.w*r.h;
+        if(waste<bw){bw=waste;bi=i}
+      }
+    }
+    if(bi<0)return false;
+    const fr=bin.free.splice(bi,1)[0];
+    const x=fr.x, y=fr.y;
+    bin.rects.push({x,y,w:r.w,h:r.h,inst:r.inst});
+    // Guillotine split with kerf gap
+    const right={x:x+r.w+kerf,y:y,w:fr.w-r.w-kerf,h:r.h};
+    const top  ={x:x,y:y+r.h+kerf,w:fr.w,h:fr.h-r.h-kerf};
+    if(right.w>1e-9 && right.h>1e-9)bin.free.push(right);
+    if(top.w>1e-9 && top.h>1e-9)bin.free.push(top);
+    return true;
+  }
+
+  for(const inst of candidates){
+    const iw=inst.w+kerf, ih=inst.h+kerf;
+    let placed=false;
+    for(const bin of bins){ if(placeInBin(bin,{w:iw,h:ih,inst:inst})){placed=true;break} }
+    if(placed) placedIds.add(inst.id);
+  }
+
+  // Materialize boards (subtract kerf on right/top)
+  const boards=[];
+  for(const bin of bins){
+    if(bin.rects.length===0) continue;
+    const boardW=bin.W-kerf, boardH=bin.H-kerf;
+    const rects=bin.rects.map(r=>{
+      const rw=Math.max(0,Math.min(r.w-kerf,boardW-r.x));
+      const rh=Math.max(0,Math.min(r.h-kerf,boardH-r.y));
+      return {name:r.inst.name,x:r.x,y:r.y,w:rw,h:rh,id:r.inst.id};
+    });
+    boards.push({stock_len:stockLen,stock_w:stockW,board_w:boardW,board_h:boardH,rects});
+  }
+  return {boards,placedIds};
+}
+
+function stagedPackForN(N,pieces,stocks,params){
+  const {kerf,qtyMult,trims}=params;
+  const remaining=buildInstances(N,pieces,qtyMult);
+  const sgroups=groupStocks(stocks);
+  const placed=new Set();
+  const outBoards=[];
+  for(const g of sgroups){
+    if(g.qty<=0) continue;
+    const cand=remaining.filter(p=>p.h<=g.len+1e-6 && !placed.has(p.id));
+    if(!cand.length) continue;
+    cand.sort((a,b)=>{
+      const ka=priorityKey(a.h,g.len), kb=priorityKey(b.h,g.len);
+      return (ka[0]-kb[0])||(ka[1]-kb[1])||(ka[2]-kb[2]);
+    });
+    // Light area budget (like Python)
+    const budget=0.985*(g.len*g.w*g.qty);
+    let added=0; const feed=[];
+    for(const c of cand){const a=c.w*c.h; if(added+a>budget*1.08) continue; feed.push(c); added+=a;}
+    if(!feed.length) continue;
+    const {boards,placedIds}=packGroup(feed,g.len,g.w,g.qty,kerf,trims);
+    for(const id of placedIds) placed.add(id);
+    outBoards.push(...boards);
+  }
+  return {success: placed.size===remaining.length, boards: outBoards};
+}
+
+function findMaxSets(pieces,stocks,params){
+  const areaS=areaStock(stocks);
+  const areaSet=areaOneSet(pieces)*(params.qtyMult||1);
+  let ub=Math.max(1,Math.floor(areaS/Math.max(areaSet,1e-9))+3);
+  let bestN=0, bestBoards=[];
+  for(let N=1; N<=ub; N++){
+    const {success,boards}=stagedPackForN(N,pieces,stocks,params);
+    if(success){bestN=N;bestBoards=boards;} else break;
+  }
+  return {maxSets:bestN, boards:bestBoards};
+}
+
+/* ---------- Shelves grouping ----------*/
+function groupShelves(rects){
+  const m=new Map();
+  for(const r of rects){
+    const k=`${r.y.toFixed(3)}|${r.h.toFixed(3)}`;
+    if(!m.has(k))m.set(k,[]);
+    m.get(k).push(r);
+  }
+  const shelves=[];
+  for(const [k,arr] of m){
+    const [ys,hs]=k.split("|");
+    const y=parseFloat(ys), h=parseFloat(hs);
+    arr.sort((a,b)=>a.x===b.x?a.y-b.y:a.x-b.x);
+    shelves.push({y,h,pieces:arr});
+  }
+  shelves.sort((a,b)=>a.y-b.y);
+  return shelves;
+}
+
+/* ---------- Grayscale fills (0.75 → 1.0) ----------*/
+function grayForName(name){
+  const shades=[0.75,0.8,0.85,0.9,0.95,1.0];
+  let h=0; for(let i=0;i<name.length;i++) h=(h*31 + name.charCodeAt(i))>>>0;
+  const tone=shades[h%shades.length];
+  const c=Math.round(255*tone);
+  return `rgb(${c},${c},${c})`;
+}
+
+/* ---------- SVG rendering with scale (units-per-inch) ----------*/
+function boardSVG(board, idx, opts){
+  const {upi=40,fontPx=11,strokePx=0.9}=opts;
+  const S=upi; // svg units per inch
+  const W=board.board_w*S, H=board.board_h*S;
+  const headerH=18; // px for the title band
+  const svgNS="http://www.w3.org/2000/svg";
+  const svg=document.createElementNS(svgNS,"svg");
+  svg.setAttribute("viewBox",`0 0 ${W} ${H+headerH}`);
+  svg.setAttribute("width","100%"); svg.setAttribute("height","auto");
+
+  // Outline
+  const rect=document.createElementNS(svgNS,"rect");
+  rect.setAttribute("x",0); rect.setAttribute("y",headerH);
+  rect.setAttribute("width",W); rect.setAttribute("height",H);
+  rect.setAttribute("fill","#fff");
+  rect.setAttribute("stroke","#000"); rect.setAttribute("stroke-width",String(strokePx));
+  svg.appendChild(rect);
+
+  // Title
+  const title=document.createElementNS(svgNS,"text");
+  title.setAttribute("x",4); title.setAttribute("y",headerH-6);
+  title.setAttribute("font-size",String(fontPx));
+  title.textContent=`Board ${idx+1} — ${round3(board.stock_w)} × ${round3(board.stock_len)} in (drawn: ${round3(board.board_w)} × ${round3(board.board_h)})`;
+  svg.appendChild(title);
+
+  // Shelves + pieces
+  const shelves=groupShelves(board.rects);
+  for(const sh of shelves){
+    const y0=sh.y*S, y1=(sh.y+sh.h)*S;
+    // dashed shelf line at top
+    const hline=document.createElementNS(svgNS,"line");
+    hline.setAttribute("x1",0); hline.setAttribute("x2",W);
+    hline.setAttribute("y1",headerH+y1); hline.setAttribute("y2",headerH+y1);
+    hline.setAttribute("stroke","#555"); hline.setAttribute("stroke-dasharray","4 3");
+    hline.setAttribute("stroke-width",String(strokePx));
+    svg.appendChild(hline);
+
+    for(const p of sh.pieces){
+      const x=p.x*S, y=p.y*S, w=p.w*S, h=p.h*S;
+      // piece rect with light grayscale fill
+      const r=document.createElementNS(svgNS,"rect");
+      r.setAttribute("x",x); r.setAttribute("y",headerH+y);
+      r.setAttribute("width",w); r.setAttribute("height",h);
+      r.setAttribute("fill",grayForName(p.name));
+      r.setAttribute("stroke","#000"); r.setAttribute("stroke-width",String(strokePx));
+      svg.appendChild(r);
+
+      // centered label
+      const t=document.createElementNS(svgNS,"text");
+      t.setAttribute("x",x+w/2); t.setAttribute("y",headerH+y+h/2+fontPx*0.35);
+      t.setAttribute("text-anchor","middle"); t.setAttribute("font-size",String(fontPx));
+      t.textContent=p.name; svg.appendChild(t);
+
+      // dotted vertical cut at right edge
+      const v=document.createElementNS(svgNS,"line");
+      v.setAttribute("x1",x+w); v.setAttribute("x2",x+w);
+      v.setAttribute("y1",headerH+y0); v.setAttribute("y2",headerH+y1);
+      v.setAttribute("stroke","#444"); v.setAttribute("stroke-dasharray","2 3");
+      v.setAttribute("stroke-width",String(strokePx));
+      svg.appendChild(v);
+    }
+  }
+  return svg;
+}
+
+/* ---------- UI wiring ----------*/
+const piecesTA=document.getElementById("pieces");
+const stocksTA=document.getElementById("stocks");
+const kerfI=document.getElementById("kerf");
+const gapMultI=document.getElementById("gapMult");
+const qtyMultI=document.getElementById("qtyMult");
+const trimL=document.getElementById("trimL");
+const trimR=document.getElementById("trimR");
+const trimB=document.getElementById("trimB");
+const trimT=document.getElementById("trimT");
+const upiI=document.getElementById("upi");
+const fontPxI=document.getElementById("fontPx");
+const strokePxI=document.getElementById("strokePx");
+const runBtn=document.getElementById("runBtn");
+const printBtn=document.getElementById("printBtn");
+const exportBtn=document.getElementById("exportBtn");
+const pagesDiv=document.getElementById("pages");
+const summaryDiv=document.getElementById("summary");
+
+// Prefill with your example data
+piecesTA.value = JSON.stringify([
+  {"width": 5.25 + 3.75, "length": 3.0,   "qty": 2, "name": "Side+Front"},
+  {"width": 3.25,        "length": 2.25,  "qty": 1, "name": "Front Maze"},
+  {"width": 3.25,        "length": 1.75,  "qty": 1, "name": "Back Maze"},
+  {"width": 5.0,         "length": 3.5,   "qty": 2, "name": "Top or Bottom"},
+  {"width": 3.5,         "length": 3.25,  "qty": 1, "name": "Shelf"},
+  {"width": 3.0,         "length": 0.625, "qty": 4, "name": "BoxSide 3.0"},
+  {"width": 3.5,         "length": 0.625, "qty": 4, "name": "BoxSide 3.5"},
+  {"width": 3.0,         "length": 0.9,   "qty": 1, "name": "Slider 1"},
+  {"width": 3.0,         "length": 0.75,  "qty": 1, "name": "Slider 2"}
+], null, 2);
+
+stocksTA.value = JSON.stringify([
+  {"width": 20.0, "length": 3.5, "qty": 8},
+  {"width": 20.0, "length": 3.0, "qty": 4},
+  {"width": 20.0, "length": 2.5, "qty": 4},
+  {"width": 20.0, "length": 2.0, "qty": 8}
+], null, 2);
+
+runBtn.addEventListener("click", ()=>{
+  try{
+    const pieces = JSON.parse(piecesTA.value);
+    const stocks = JSON.parse(stocksTA.value);
+    const params = {
+      kerf: parseFloat(kerfI.value),
+      gapMult: parseFloat(gapMultI.value),
+      qtyMult: parseInt(qtyMultI.value,10) || 1,
+      trims: {L:+trimL.value||0, R:+trimR.value||0, B:+trimB.value||0, T:+trimT.value||0}
+    };
+    const t0=performance.now();
+    const {maxSets, boards}=findMaxSets(pieces,stocks,params);
+    const ms=Math.round(performance.now()-t0);
+
+    boards.sort((a,b)=> a.stock_len===b.stock_len ? b.rects.length-a.rects.length : a.stock_len-b.stock_len);
+    pagesDiv.innerHTML="";
+    if(maxSets===0){ summaryDiv.textContent="No complete project could be packed with the given stock."; return; }
+    summaryDiv.textContent=`Max complete projects: ${maxSets} • Boards used: ${boards.length} • Time: ${ms} ms`;
+
+    const upi=+upiI.value||40, fontPx=+fontPxI.value||11, strokePx=+strokePxI.value||0.9;
+    boards.forEach((b,idx)=>{
+      const page=document.createElement("div");
+      page.className="boardPage";
+      const svg=boardSVG(b,idx,{upi,fontPx,strokePx});
+      const tools=document.createElement("div");
+      tools.className="tools";
+      const save=document.createElement("button");
+      save.textContent="Download SVG";
+      save.addEventListener("click", ()=>{
+        const s=new XMLSerializer().serializeToString(svg);
+        const blob=new Blob([s],{type:"image/svg+xml"});
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement("a");
+        a.href=url; a.download=`board_${idx+1}.svg`; a.click();
+        URL.revokeObjectURL(url);
+      });
+      tools.appendChild(save);
+      page.appendChild(svg);
+      page.appendChild(tools);
+      pagesDiv.appendChild(page);
+    });
+
+  }catch(e){
+    console.error(e);
+    alert("Input error: "+e.message);
+  }
+});
+printBtn.addEventListener("click",()=>window.print());
+exportBtn.addEventListener("click",()=>{
+  const bundle={
+    kerf:+kerfI.value, gapMult:+gapMultI.value, qtyMult:+qtyMultI.value||1,
+    trims:{L:+trimL.value||0,R:+trimR.value||0,B:+trimB.value||0,T:+trimT.value||0},
+    pieces:JSON.parse(piecesTA.value), stocks:JSON.parse(stocksTA.value)
+  };
+  const blob=new Blob([JSON.stringify(bundle,null,2)],{type:"application/json"});
+  const url=URL.createObjectURL(blob); const a=document.createElement("a");
+  a.href=url; a.download="cutting_plan.json"; a.click(); URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
